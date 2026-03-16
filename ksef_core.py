@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import json
 import logging
+import re
+import time
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional
 
@@ -28,10 +31,20 @@ class KsefConfig:
     verify_ssl: bool = True
 
 
+@dataclass
+class DownloadStats:
+    total: int = 0
+    saved: int = 0
+    skipped: int = 0
+    failed: int = 0
+
+
 class KsefClient:
-    def __init__(self, cfg: KsefConfig, timeout: int = 60) -> None:
+    def __init__(self, cfg: KsefConfig, timeout: int = 60, retries: int = 2, retry_delay: float = 1.0) -> None:
         self.cfg = cfg
         self.timeout = timeout
+        self.retries = retries
+        self.retry_delay = retry_delay
         self.session = self._build_session()
 
     def _build_session(self):
@@ -72,6 +85,23 @@ class KsefClient:
         session.verify = self.cfg.verify_ssl
         return session
 
+    def _request_with_retry(self, method: str, url: str, **kwargs: Any):
+        last_exc: Optional[Exception] = None
+        for attempt in range(1, self.retries + 2):
+            try:
+                response = self.session.request(method, url, timeout=self.timeout, **kwargs)
+                response.raise_for_status()
+                return response
+            except Exception as exc:  # noqa: BLE001
+                last_exc = exc
+                LOGGER.warning("Błąd żądania %s %s (próba %s): %s", method, url, attempt, exc)
+                if attempt <= self.retries:
+                    time.sleep(self.retry_delay)
+
+        if last_exc:
+            raise last_exc
+        raise RuntimeError("Nieznany błąd HTTP")
+
     def list_documents(self, from_date: str, to_date: str, page_size: int = 100) -> List[Dict[str, Any]]:
         documents: List[Dict[str, Any]] = []
         page = 1
@@ -87,8 +117,7 @@ class KsefClient:
             }
             url = f"{self.cfg.base_url.rstrip('/')}/api/online/Query/Invoice/Sync"
             LOGGER.info("Pobieram listę dokumentów: strona=%s", page)
-            response = self.session.post(url, data=json.dumps(payload), timeout=self.timeout)
-            response.raise_for_status()
+            response = self._request_with_retry("POST", url, data=json.dumps(payload))
             data = response.json()
 
             page_docs = data.get("invoices") or data.get("elements") or []
@@ -104,8 +133,7 @@ class KsefClient:
 
     def download_document_xml(self, ksef_number: str) -> bytes:
         url = f"{self.cfg.base_url.rstrip('/')}/api/online/Invoice/Get/{ksef_number}"
-        response = self.session.get(url, timeout=self.timeout)
-        response.raise_for_status()
+        response = self._request_with_retry("GET", url)
 
         ctype = response.headers.get("Content-Type", "")
         if "application/json" in ctype.lower():
@@ -116,6 +144,18 @@ class KsefClient:
         return response.content
 
 
+def parse_and_validate_dates(from_date: str, to_date: str) -> None:
+    fmt = "%Y-%m-%d"
+    try:
+        start = datetime.strptime(from_date, fmt)
+        end = datetime.strptime(to_date, fmt)
+    except ValueError as exc:
+        raise ValueError("Daty muszą mieć format YYYY-MM-DD") from exc
+
+    if start > end:
+        raise ValueError("Data 'od' nie może być późniejsza niż data 'do'")
+
+
 def validate_config(cfg: KsefConfig) -> None:
     if not cfg.token:
         raise ValueError("Brak tokenu KSeF.")
@@ -124,34 +164,66 @@ def validate_config(cfg: KsefConfig) -> None:
     if not cfg.nip.isdigit() or len(cfg.nip) != 10:
         raise ValueError("NIP musi zawierać 10 cyfr")
 
+    if cfg.cert_type == "pkcs12" and not cfg.cert_path:
+        raise ValueError("Dla certyfikatu pkcs12 podaj --cert-path")
+    if cfg.cert_type == "pem" and (not cfg.cert_pem or not cfg.key_pem):
+        raise ValueError("Dla certyfikatu pem podaj --cert-pem i --key-pem")
+
+
+def extract_ksef_number(doc: Dict[str, Any]) -> Optional[str]:
+    ksef_number = (
+        doc.get("ksefReferenceNumber")
+        or doc.get("ksefNumber")
+        or doc.get("invoiceNumber")
+        or doc.get("referenceNumber")
+    )
+    return str(ksef_number) if ksef_number else None
+
+
+def safe_filename(name: str) -> str:
+    return re.sub(r"[^A-Za-z0-9._-]", "_", name)
+
 
 def save_documents(
     client: KsefClient,
     docs: Iterable[Dict[str, Any]],
     out_dir: Path,
     progress_callback: Optional[Callable[[int, int, str], None]] = None,
-) -> int:
+    overwrite: bool = False,
+) -> DownloadStats:
     out_dir.mkdir(parents=True, exist_ok=True)
     docs_list = list(docs)
-    total = len(docs_list)
-    saved = 0
+    stats = DownloadStats(total=len(docs_list))
+    seen: set[str] = set()
 
     for index, doc in enumerate(docs_list, start=1):
-        ksef_number = (
-            doc.get("ksefReferenceNumber")
-            or doc.get("ksefNumber")
-            or doc.get("invoiceNumber")
-            or doc.get("referenceNumber")
-        )
+        ksef_number = extract_ksef_number(doc)
         if not ksef_number:
             LOGGER.warning("Pominięto dokument bez numeru KSeF: %s", doc)
+            stats.failed += 1
             continue
 
-        content = client.download_document_xml(str(ksef_number))
-        filename = out_dir / f"{ksef_number}.xml"
-        filename.write_bytes(content)
-        saved += 1
-        if progress_callback:
-            progress_callback(index, total, str(filename))
+        if ksef_number in seen:
+            stats.skipped += 1
+            continue
+        seen.add(ksef_number)
 
-    return saved
+        filename = out_dir / f"{safe_filename(ksef_number)}.xml"
+        if filename.exists() and not overwrite:
+            stats.skipped += 1
+            if progress_callback:
+                progress_callback(index, stats.total, f"Pominięto istniejący plik: {filename}")
+            continue
+
+        try:
+            content = client.download_document_xml(ksef_number)
+            filename.write_bytes(content)
+            stats.saved += 1
+            if progress_callback:
+                progress_callback(index, stats.total, f"Zapisano: {filename}")
+        except Exception as exc:  # noqa: BLE001
+            stats.failed += 1
+            if progress_callback:
+                progress_callback(index, stats.total, f"Błąd {ksef_number}: {exc}")
+
+    return stats
