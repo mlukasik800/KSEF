@@ -4,7 +4,7 @@ Ulepszony program do automatycznego pobierania dokumentów z KSeF na podstawie c
 
 ## Najważniejsze ulepszenia
 
-- ✅ Nowy, wygodny interfejs **GUI** (`tkinter`) z wyborem plików i czytelnym logiem.
+- ✅ GUI przeniesione z `tkinter` na **PySide6 (Qt)** – nowoczesny, dużo ładniejszy interfejs.
 - ✅ Bezpieczniejsze działanie: walidacja NIP, URL i zakresu dat.
 - ✅ Lepsza odporność na chwilowe problemy sieciowe (retry żądań HTTP).
 - ✅ Czytelne podsumowanie pobierania: zapisane / pominięte / błędy.
@@ -26,7 +26,7 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-## Uruchomienie GUI
+## Uruchomienie GUI (PySide6/Qt)
 
 ```bash
 python ksef_downloader.py --gui
@@ -59,7 +59,7 @@ python ksef_downloader.py \
 ## Struktura projektu
 
 - `ksef_core.py` – logika API KSeF, walidacja, retry, zapis dokumentów.
-- `ksef_gui.py` – interfejs graficzny.
+- `ksef_gui.py` – nowoczesny interfejs PySide6 (Qt).
 - `ksef_downloader.py` – punkt startowy (CLI/GUI).
 - `tests/test_core.py` – testy funkcji pomocniczych.
 
